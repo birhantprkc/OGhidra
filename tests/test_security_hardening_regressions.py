@@ -12,7 +12,7 @@ import tempfile
 import types
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -85,6 +85,81 @@ class SecurityHardeningRegressionTests(unittest.TestCase):
         self.assertEqual(request_data["headers"]["Authorization"], "Bearer secret")
         self.assertTrue(request_data["verify"])
         self.assertEqual(request_data["json"]["model"], "gpt-test")
+
+    def test_client_health_uses_shared_probe_without_changing_generation_budget(self):
+        client = CustomAPIClient(self._make_custom_api_config(max_tokens=16000))
+        client.logger = Mock()
+        with patch("src.api_health.requests.post") as post:
+            post.return_value = Mock(status_code=200)
+            self.assertTrue(client.check_health())
+            self.assertEqual(post.call_args.kwargs["json"]["max_completion_tokens"], 4096)
+            self.assertEqual(client.max_tokens, 16000)
+            post.return_value = Mock(status_code=400)
+            post.return_value.json.return_value = {"error": {"message": "Unknown model"}}
+            self.assertFalse(client.check_health())
+            self.assertIn("Unknown model", client.logger.error.call_args.args[2])
+
+    def test_dialog_displays_network_and_non_json_errors(self):
+        import requests
+
+        dialog = ServerConfigDialog.__new__(ServerConfigDialog)
+        dialog.provider_var = FakeVar("custom_api")
+        dialog.custom_api_url_var = FakeVar("https://example.test/v1")
+        dialog.custom_api_key_var = FakeVar("secret")
+        dialog.custom_api_model_var = FakeVar("alias")
+        dialog.custom_api_verify_ssl_var = FakeVar(True)
+        dialog.ghidra_url_var = FakeVar("http://localhost:8080")
+        dialog.config = SimpleNamespace(ghidra=SimpleNamespace(backend="http"))
+        with (
+            patch("src.gui.server_config_dialog.threading.Thread") as thread,
+            patch("src.gui.server_config_dialog.run_on_ui", side_effect=lambda callback: callback()),
+            patch("src.gui.server_config_dialog.messagebox.showinfo") as show,
+            patch("requests.get", return_value=Mock(status_code=200)),
+            patch("src.api_health.requests.post") as post,
+        ):
+            thread.side_effect = lambda target, **kwargs: SimpleNamespace(start=target)
+            post.side_effect = requests.ConnectionError("DNS lookup failed")
+            dialog._test_connections()
+            self.assertIn("Custom API: [ERROR] DNS lookup failed", show.call_args.args[1])
+            post.side_effect = None
+            post.return_value = Mock(status_code=502, text="Gateway unavailable")
+            post.return_value.json.side_effect = ValueError("not JSON")
+            dialog._test_connections()
+            self.assertIn("HTTP 502", show.call_args.args[1])
+            self.assertIn("Gateway unavailable", show.call_args.args[1])
+
+    def test_ollama_dialog_authenticates_tags_and_both_embedding_endpoints(self):
+        dialog = ServerConfigDialog.__new__(ServerConfigDialog)
+        dialog.provider_var = FakeVar("ollama")
+        dialog.ollama_url_var = FakeVar("https://ollama.example.test")
+        dialog.embedding_model_var = FakeVar("embedding-model")
+        dialog.ghidra_url_var = FakeVar("http://localhost:8080")
+        dialog.config = SimpleNamespace(
+            ollama=SimpleNamespace(username="test-user", password="test-password"),
+            ghidra=SimpleNamespace(backend="http"),
+        )
+        expected_auth = ("test-user", "test-password")
+        with (
+            patch("src.gui.server_config_dialog.threading.Thread") as thread,
+            patch("src.gui.server_config_dialog.run_on_ui", side_effect=lambda callback: callback()),
+            patch("src.gui.server_config_dialog.messagebox.showinfo") as show,
+            patch("requests.get", return_value=Mock(status_code=200)) as get,
+            patch("requests.post") as post,
+        ):
+            thread.side_effect = lambda target, **kwargs: SimpleNamespace(start=target)
+            post.side_effect = [Mock(status_code=404), Mock(status_code=200)]
+            dialog._test_connections()
+            get.assert_any_call("https://ollama.example.test/api/tags", timeout=5, auth=expected_auth)
+            self.assertEqual(post.call_count, 2)
+            for call, endpoint in zip(post.call_args_list, ("embed", "embeddings"), strict=True):
+                self.assertEqual(call.args[0], f"https://ollama.example.test/api/{endpoint}")
+                self.assertEqual(call.kwargs["auth"], expected_auth)
+            for call in get.call_args_list:
+                if call.args[0].startswith("http://localhost:8080"):
+                    self.assertNotIn("auth", call.kwargs)
+            self.assertIn("Ollama: [OK] Connected", show.call_args.args[1])
+            self.assertIn("Available (legacy API)", show.call_args.args[1])
+            self.assertNotIn("test-password", show.call_args.args[1])
 
     def test_server_dialog_env_updates_persist_verify_ssl(self):
         dialog = ServerConfigDialog.__new__(ServerConfigDialog)
